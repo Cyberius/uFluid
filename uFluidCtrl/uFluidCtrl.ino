@@ -1,44 +1,32 @@
-#define SIN_LEN_QUARTER 8
-#define SIN_LEN         (SIN_LEN_QUARTER*4)
-#define CLOCK_FREQ      16000000
-#define SINE_DIVISOR    8
-#define SINE_INT_OVF    17
-
-#define MAX_FREQ        100
-#define MAX_AMPL        100
-#define MAX_RATE        100
-
+/* Filter coefficient for smoothing pressure readings */
 #define FILTER_ALPHA    9
+
+/* Maximum output value, dependent on number of solenoids
+  2 solenoids = 2 bits = 0b11 = 3
+*/
 #define MASK_MAX        3
+
+/* Used to limit integrator windup */
 #define WINDUP_MAX      10
 
+/* Pin locations */
 #define P1_PIN          0
 #define SOL1_PIN        9
 #define SOL2_PIN        10
 
-char sineArray[SIN_LEN_QUARTER + 1];
-
-volatile int timer = 0;
-volatile int overflow = 100;
-volatile int go = 0;
-char freq;
-char ampl = MAX_AMPL;
-char fsweep_freq_start;
-char fsweep_freq_end;
-int fsweep_rate;
-volatile int fsweep_count;
-char fsweeping = 0;
-
 void setup()
 {
+  /* Initialize serial comms */
   Serial.begin(9600);
+  
+  /* Set solenoid pins as outputs */
   pinMode( SOL1_PIN, OUTPUT );
   pinMode( SOL2_PIN, OUTPUT );
-  
 } 
 
 void loop()
 {
+  /* Commands */
   typedef enum
   {
     MODE_NONE = 0,
@@ -50,23 +38,24 @@ void loop()
     MODE_D,
   } E_COMMS_MODE;
   
-  char outMask = 0;
-  int target = 0;
-  float drive = 0;
-  int value;
   E_COMMS_MODE comms_mode = MODE_NONE;
-  float error;
-  float last_error = 0;
-  float p = 2;
-  float i = 0.01;
-  float d = 30.0;
-  float integral = 0;
-  float pressure = 0;
-  bool control = 1;
-  float pressure_calib;
+  char outMask = 0;         // Solenoid output bit mask
+  int target = 0;           // Control target
+  float drive = 0;          // Control output
+  int value;                // Raw pressure reading
+  float error;              // Control error
+  float last_error = 0;     // Control error from last iteration
+  float p = 2;              // Control Proportional coefficient
+  float i = 0.01;           // Control Integral coefficient
+  float d = 30.0;           // Control Differential coefficient
+  float integral = 0;       // Control integral accumulator  
+  float pressure = 0;       // Filtered pressure in ADC counts
+  float pressure_calib;     // Filtered pressure in kPa
+  bool control = 1;         // Control loop enabled
   
   while ( 1 )
   {
+    /* Process characters in comms buffer */
     while ( Serial.available() > 0 )
     {
       int val_int;
@@ -76,6 +65,7 @@ void loop()
       switch ( comms_mode )
       {
         case MODE_NONE:
+          /* Decide which command we have received */
           mode_char = Serial.read(); 
           
           switch ( mode_char )
@@ -110,7 +100,8 @@ void loop()
               break;
           }
           break;
-          
+        
+        /* Read additional values, depending on command */
         case MODE_P:
         case MODE_I:
         case MODE_D:
@@ -124,10 +115,12 @@ void loop()
           break;
       }
       
+      /* The command is finished when we get an end of line character */
       if ( Serial.peek() == '\n' )
       {
         Serial.read();
         
+        /* Process command and associated parameters */
         switch ( comms_mode )
         {
           case MODE_MASK:
@@ -162,29 +155,48 @@ void loop()
       }
     }
     
-    digitalWrite( SOL1_PIN, ( outMask & 1 ) ? HIGH : LOW );
-    digitalWrite( SOL2_PIN, ( outMask & 2 ) ? HIGH : LOW );
-    
+    /* Read pressure */
     value = analogRead( P1_PIN );
+    
+    /* Apply filter to smooth pressure reading */
     pressure = ( FILTER_ALPHA * pressure + (float)value ) / 10;
+    
+    /* Apply calibration */
+    pressure_calib = ( pressure * 5.0 / 1024.0 - 0.5 ) * 100;
+    
+    /* Control loop start.  Calculate error. */
     error = ( (float)target - pressure_calib ) * ( 230.0/60.0 );
+    
+    /* Calculate integral and apply windup limiting. */
     integral += error * i;
     if ( integral < -(float)WINDUP_MAX )
       integral = -(float)WINDUP_MAX;
     else if ( integral > (float)WINDUP_MAX )
       integral = (float)WINDUP_MAX;
+    
+    /* Calculate output, consisting of P, I and D factors. */
     drive = error * p + integral + ( error - last_error ) * d;
+    
+    /* Limit output to be within range allowed by number of solenoids */
     if ( drive < 0.0 )
       drive = 0.0;
     else if ( drive > (float)MASK_MAX )
       drive = (float)MASK_MAX;
     
+    /* If we have set a control target, translate control output to
+       solenoid output mask.
+    */
     if ( control )
       outMask = round(drive);
+    
+    /* Record last value for use in next iteration */
     last_error = error;
     
-    pressure_calib = ( pressure * 5.0 / 1024.0 - 0.5 ) * 100;
+    /* Set solenoid outputs */
+    digitalWrite( SOL1_PIN, ( outMask & 1 ) ? HIGH : LOW );
+    digitalWrite( SOL2_PIN, ( outMask & 2 ) ? HIGH : LOW );
     
+    /* Print control data */
     Serial.print( "(" );
     Serial.print( (int)target );
     Serial.print( " / " );
